@@ -379,8 +379,9 @@ class _MixerScreenState extends State<MixerScreen> {
   }
 
   void _subMeters() {
-    _send('/meters', ['/meters/1', 2]);
-    _send('/meters', ['/meters/5', 0, 0]);
+    _send('/meters', ['/meters/1', 2]); // 32 입력 채널
+    _send('/meters', ['/meters/2', 2]); // 16 mix bus + main LR
+    _send('/meters', ['/meters/3', 2]); // 6 aux send + 8 aux return + 8 fx return
   }
 
   Ch? _find(String kind, int n) {
@@ -476,31 +477,50 @@ class _MixerScreenState extends State<MixerScreen> {
     final bd = ByteData.sublistView(blob);
     final count = bd.getInt32(0, Endian.little);
     double f(int i) => bd.getFloat32(4 + i * 4, Endian.little).clamp(0.0, 8.0);
+    void up(Ch c, double v) {
+      c.lvl = v;
+      if (v > c.pk) c.pk = v;
+      if (v >= 1.0) c.clipUntil = 1.5;
+    }
+
     if (count >= 90) {
+      // /meters/1 : 입력 채널 32
       setState(() {
         for (int i = 0; i < 32; i++) {
           if (4 + (i + 1) * 4 > blob.length) break;
-          final v = f(i);
-          inputs[i].lvl = v;
-          if (v > inputs[i].pk) inputs[i].pk = v;
-          if (v >= 1.0) inputs[i].clipUntil = 1.5;
+          up(inputs[i], f(i));
         }
       });
-    } else if (count >= 26) {
-      if (4 + 26 * 4 > blob.length) return;
+    } else if (count >= 40) {
+      // /meters/2 : 16 bus master + [22]=main L, [23]=main R
       setState(() {
-        mainL = f(24);
-        mainR = f(25);
-        if (mainL > mainPkL) mainPkL = mainL;
-        if (mainR > mainPkR) mainPkR = mainR;
-        if (mainL >= 1.0 || mainR >= 1.0) mainClip = 1.5;
+        for (int i = 0; i < 16; i++) {
+          if (4 + (i + 1) * 4 > blob.length) break;
+          up(buses[i], f(i));
+        }
+        if (4 + 24 * 4 <= blob.length) {
+          mainL = f(22);
+          mainR = f(23);
+          if (mainL > mainPkL) mainPkL = mainL;
+          if (mainR > mainPkR) mainPkR = mainR;
+          if (mainL >= 1.0 || mainR >= 1.0) mainClip = 1.5;
+        }
+      });
+    } else if (count >= 20) {
+      // /meters/3 : [0..5]aux send, [6..13]aux return, [14..21]fx return
+      setState(() {
+        for (int i = 0; i < 8; i++) {
+          if (4 + (14 + i + 1) * 4 > blob.length) break;
+          up(auxins[i], f(6 + i));
+          up(fxrtns[i], f(14 + i));
+        }
       });
     }
   }
 
   void _decayMeters() {
     if (!_connected) return;
-    for (final c in inputs) {
+    for (final c in all) {
       if (c.lvl > 0) c.lvl = c.lvl < 0.001 ? 0 : c.lvl * 0.86;
       if (c.pk > 0) c.pk = c.pk < 0.001 ? 0 : c.pk * 0.90;
       if (c.clipUntil > 0) c.clipUntil = (c.clipUntil - 0.05).clamp(0.0, 2.0);
@@ -834,8 +854,8 @@ class _MixerScreenState extends State<MixerScreen> {
               child: CustomPaint(
                 painter: FaderMeterPainter(
                   fad: c.fad,
-                  lvl: c.hasMeter ? c.lvl : 0,
-                  pk: c.hasMeter ? c.pk : 0,
+                  lvl: c.lvl,
+                  pk: c.pk,
                   clip: clip,
                 ),
                 child: const SizedBox.expand(),
@@ -928,7 +948,7 @@ class _MixerScreenState extends State<MixerScreen> {
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(7)),
         ),
         onPressed: onTap,
-        child: Text(on ? 'ON' : 'MUTE', style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700)),
+        child: Text(on ? 'ON' : 'MUTE', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: on ? const Color(0xFFD7DDE4) : Colors.white)),
       ),
     );
   }
@@ -1199,9 +1219,9 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
                   ),
                   const Spacer(),
                   FilledButton(
-                    style: FilledButton.styleFrom(backgroundColor: const Color(0xFF2C333D)),
+                    style: FilledButton.styleFrom(backgroundColor: const Color(0xFF3A4654), foregroundColor: Colors.white),
                     onPressed: () => Navigator.of(context).pop(),
-                    child: const Text('닫기 ✕'),
+                    child: const Text('닫기 ✕', style: TextStyle(fontWeight: FontWeight.w700)),
                   ),
                 ],
               ),
@@ -1569,8 +1589,9 @@ class EqPainter extends CustomPainter {
       for (int i = 0; i < N; i++) {
         final fx = (i + 0.5) / N;
         final fhz = 20 * math.pow(1000, fx).toDouble();
-        double lv = 0.46 + 0.26 * math.sin(t * 1.7 + i * 0.7) + 0.17 * math.sin(t * 4.3 + i * 1.9) + 0.09 * math.sin(t * 9 + i * 0.4);
-        lv = math.max(0.03, lv * (1 - fx * 0.4));
+        double lv = 0.4 + 0.3 * math.sin(t * 1.7 + i * 0.7) + 0.2 * math.sin(t * 4.3 + i * 1.9) + 0.1 * math.sin(t * 9 + i * 0.4);
+        // 실제 채널 레벨(c.lvl)을 반영 — 신호가 있어야 RTA가 살아남 (라이브)
+        lv = math.max(0.0, lv * (1 - fx * 0.4)) * (0.1 + meterFrac(ch.lvl) * 1.2);
         if (ch.eqon) {
           double g = 0;
           for (final b in ch.eq) {
