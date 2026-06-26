@@ -116,6 +116,7 @@ OscMsg? oscDecode(Uint8List data) {
 }
 
 String nn(int c) => c.toString().padLeft(2, '0');
+int nowMs() => DateTime.now().millisecondsSinceEpoch;
 
 // ===== 변환 =====
 String faderDb(double f) {
@@ -231,6 +232,11 @@ class Ch {
   bool dynOn = false;
   double dynThr = 0.45;
   double lvl = 0, pk = 0, clipUntil = 0;
+  // 이 시각(ms)까지는 콘솔 echo로 fader/pan/gain을 덮어쓰지 않는다 — 내가 방금 조작한 컨트롤이 튀는 것 방지.
+  // 드래그 중엔 매 프레임 조작이 일어나 자동으로 계속 연장된다.
+  int echoMuteUntil = 0;
+  // 콘솔에서 EQ/게이트/컴프 현재값을 한 번이라도 받았는가. 받기 전엔 push를 막아, 가짜 기본값이 콘솔을 덮어쓰지 않게 한다.
+  bool eqLoaded = false;
   Ch(this.kind, this.n, {this.fad = 0.0});
   bool get isDca => kind == 'dca';
   // DCA는 그룹 마스터라 주소가 다르다: /dca/N (패딩 없음, /mix 없음). 나머지는 /kind/NN/mix/...
@@ -286,6 +292,7 @@ class _MixerScreenState extends State<MixerScreen> {
 
   double mainFader = 0.75;
   bool mainOn = true;
+  int _mainEchoMuteUntil = 0;
   double mainL = 0, mainR = 0, mainPkL = 0, mainPkR = 0, mainClip = 0;
 
   final _mix = RegExp(r'^/(ch|auxin|fxrtn|bus)/(\d\d)/mix/(fader|on|pan)$');
@@ -294,6 +301,10 @@ class _MixerScreenState extends State<MixerScreen> {
   final _trim = RegExp(r'^/auxin/(\d\d)/preamp/trim$');
   final _dca = RegExp(r'^/dca/([1-8])/(fader|on)$');
   final _dcaCfg = RegExp(r'^/dca/([1-8])/config/(name|color)$');
+  final _eq = RegExp(r'^/(ch|auxin|fxrtn|bus)/(\d\d)/eq/([1-4])/(type|f|g|q)$');
+  final _eqOn = RegExp(r'^/(ch|auxin|fxrtn|bus)/(\d\d)/eq/on$');
+  final _gate = RegExp(r'^/(ch|auxin|fxrtn|bus)/(\d\d)/gate/(on|thr)$');
+  final _dyn = RegExp(r'^/(ch|auxin|fxrtn|bus)/(\d\d)/dyn/(on|thr)$');
 
   @override
   void initState() {
@@ -347,6 +358,7 @@ class _MixerScreenState extends State<MixerScreen> {
       _renew = Timer.periodic(const Duration(seconds: 8), (_) {
         _send('/xremote');
         _subMeters();
+        _queryMissing(); // 유실로 이름이 안 들어온 채널을 주기적으로 다시 조회(영구 고착 방지)
       });
       _decay = Timer.periodic(const Duration(milliseconds: 50), (_) => _decayMeters());
       _snack('연결됨: ${_ipCtrl.text.trim()}');
@@ -379,21 +391,77 @@ class _MixerScreenState extends State<MixerScreen> {
     } catch (_) {}
   }
 
-  void _queryAll() {
+  bool _querying = false;
+  Future<void> _queryAll() async {
+    if (_querying) return; // 4회 초기 조회·8초 갱신이 겹쳐 동시에 도는 것 방지
+    _querying = true;
+    try {
+      // DCA·버스를 먼저 조회한다(짧은 목록이라 버스트 끝에서 가장 자주 유실되던 그룹 — DCA 이름이 안 뜨던 원인).
+      // 그리고 패킷을 4개마다 6ms씩 나눠 보내 UDP 버스트 유실을 줄인다(이름이 리셋/누락되는 증상의 근본 완화).
+      final order = [...dcas, ...buses, ...auxins, ...fxrtns, ...inputs];
+      int k = 0;
+      for (final c in order) {
+        if (!_connected) return;
+        _send(c.faderAddr);
+        _send(c.onAddr);
+        if (c.hasPan) _send('${c.base}/mix/pan');
+        _send('${c.base}/config/name');
+        _send('${c.base}/config/color');
+        if (c.kind == 'ch') {
+          _send('/headamp/${(c.n - 1).toString().padLeft(3, '0')}/gain');
+        } else if (c.kind == 'auxin') {
+          _send('${c.base}/preamp/trim');
+        }
+        if ((++k % 4) == 0) await Future.delayed(const Duration(milliseconds: 6));
+      }
+      _send('/main/st/mix/fader');
+      _send('/main/st/mix/on');
+    } finally {
+      _querying = false;
+    }
+  }
+
+  // 아직 이름을 못 받은(유실된) 채널만 가볍게 재조회 — _renew(8초)에서 호출해 영구 고착 방지.
+  void _queryMissing() {
     for (final c in all) {
-      _send(c.faderAddr);
-      _send(c.onAddr);
-      if (c.hasPan) _send('${c.base}/mix/pan');
-      _send('${c.base}/config/name');
-      _send('${c.base}/config/color');
-      if (c.kind == 'ch') {
-        _send('/headamp/${(c.n - 1).toString().padLeft(3, '0')}/gain');
-      } else if (c.kind == 'auxin') {
-        _send('${c.base}/preamp/trim');
+      if (c.name.isEmpty) {
+        _send(c.faderAddr);
+        _send(c.onAddr);
+        _send('${c.base}/config/name');
+        _send('${c.base}/config/color');
       }
     }
-    _send('/main/st/mix/fader');
-    _send('/main/st/mix/on');
+  }
+
+  // 상세 화면을 열 때 그 채널의 EQ/게이트/컴프 현재값을 콘솔에서 읽어온다.
+  // 응답이 오면 eqLoaded=true가 되어 비로소 push가 허용된다(가짜 기본값으로 콘솔을 덮어쓰지 않게).
+  // 콘솔이 응답하지 않는 경우를 대비해 1.5초 뒤엔 조작을 풀어준다(영구 잠금 방지).
+  void _queryDetail(Ch c) {
+    c.eqLoaded = false;
+    void q() {
+      if (!_connected) return;
+      _send('${c.base}/eq/on');
+      for (int b = 1; b <= 4; b++) {
+        _send('${c.base}/eq/$b/type');
+        _send('${c.base}/eq/$b/f');
+        _send('${c.base}/eq/$b/g');
+        _send('${c.base}/eq/$b/q');
+      }
+      if (c.kind == 'ch') {
+        _send('${c.base}/gate/on');
+        _send('${c.base}/gate/thr');
+      }
+      if (c.kind == 'ch' || c.kind == 'bus') {
+        _send('${c.base}/dyn/on');
+        _send('${c.base}/dyn/thr');
+      }
+    }
+
+    q();
+    // UDP 유실 대비 2회 재조회. 응답을 못 받으면 eqLoaded는 계속 false로 남아 push가 안전하게 잠긴다.
+    // (예전 '1.5초 뒤 무조건 해제'는 콘솔 무응답 시 가짜 기본값을 콘솔에 덮어쓸 위험이 있어 제거했다.)
+    Timer(const Duration(milliseconds: 300), q);
+    Timer(const Duration(milliseconds: 900), q);
   }
 
   // 미터 구독: /batchsubscribe(별칭)로 여러 뱅크를 동시에 받는다(Cue-View·asm-graphics 등 검증된 패턴).
@@ -439,8 +507,11 @@ class _MixerScreenState extends State<MixerScreen> {
       final c = _find(mt.group(1)!, int.parse(mt.group(2)!));
       if (c == null) return;
       final a = m.args.first;
+      final param = mt.group(3);
+      // 뮤트(on)는 페이더 드래그와 독립된 상태라 echo를 억제하지 않는다. fader/pan만 조작 직후 무시(드래그 튐 방지).
+      if (param != 'on' && nowMs() < c.echoMuteUntil) return;
       setState(() {
-        switch (mt!.group(3)) {
+        switch (param) {
           case 'fader':
             if (a is double) c.fad = a.clamp(0.0, 1.0);
             break;
@@ -476,6 +547,7 @@ class _MixerScreenState extends State<MixerScreen> {
       final idx = int.parse(mt.group(1)!);
       if (idx >= 0 && idx < 32 && m.args.first is double) {
         final ch = inputs[idx];
+        if (nowMs() < ch.echoMuteUntil) return; // 방금 조작한 게인 → echo 무시
         // 0~1 정규화 → 실제 dB
         setState(() => ch.gain = (m.args.first as double) * (ch.gainMax - ch.gainMin) + ch.gainMin);
       }
@@ -486,6 +558,7 @@ class _MixerScreenState extends State<MixerScreen> {
     if (mt != null) {
       final c = _find('auxin', int.parse(mt.group(1)!));
       if (c != null && m.args.first is double) {
+        if (nowMs() < c.echoMuteUntil) return; // 방금 조작한 트림 → echo 무시
         // 0~1 정규화 → 실제 dB
         setState(() => c.gain = (m.args.first as double) * (c.gainMax - c.gainMin) + c.gainMin);
       }
@@ -497,6 +570,7 @@ class _MixerScreenState extends State<MixerScreen> {
     if (mt != null) {
       final c = _find('dca', int.parse(mt.group(1)!));
       if (c == null) return;
+      if (nowMs() < c.echoMuteUntil) return; // 방금 조작한 DCA → echo 무시
       final a = m.args.first;
       setState(() {
         if (mt!.group(2) == 'fader') {
@@ -524,7 +598,87 @@ class _MixerScreenState extends State<MixerScreen> {
       return;
     }
 
+    // EQ 밴드: /<kind>/NN/eq/[1-4]/(type|f|g|q) — 콘솔 현재값을 미러(받는 순간 eqLoaded=true)
+    mt = _eq.firstMatch(m.address);
+    if (mt != null) {
+      final c = _find(mt.group(1)!, int.parse(mt.group(2)!));
+      if (c == null) return;
+      c.eqLoaded = true; // 콘솔 응답 수신 표시 — echo를 무시하더라도 유지(push 잠금 해제 근거)
+      if (nowMs() < c.echoMuteUntil) return; // 방금 내가 EQ 조작 → echo 무시(떨림 방지)
+      final bi = int.parse(mt.group(3)!) - 1;
+      final a = m.args.first;
+      setState(() {
+        final b = c.eq[bi];
+        switch (mt!.group(4)) {
+          case 'type':
+            b.t = a is int ? a : (a is double ? a.round() : b.t);
+            break;
+          case 'f':
+            if (a is double) b.f = a.clamp(0.0, 1.0);
+            break;
+          case 'g':
+            if (a is double) b.g = a.clamp(0.0, 1.0);
+            break;
+          case 'q':
+            if (a is double) b.q = a.clamp(0.0, 1.0);
+            break;
+        }
+      });
+      return;
+    }
+
+    // EQ on/off
+    mt = _eqOn.firstMatch(m.address);
+    if (mt != null) {
+      final c = _find(mt.group(1)!, int.parse(mt.group(2)!));
+      if (c == null) return;
+      c.eqLoaded = true;
+      if (nowMs() < c.echoMuteUntil) return;
+      final a = m.args.first;
+      setState(() {
+        c.eqon = (a is int ? a : (a is double ? a.round() : 1)) != 0;
+      });
+      return;
+    }
+
+    // 게이트 on/threshold
+    mt = _gate.firstMatch(m.address);
+    if (mt != null) {
+      final c = _find(mt.group(1)!, int.parse(mt.group(2)!));
+      if (c == null) return;
+      c.eqLoaded = true;
+      if (nowMs() < c.echoMuteUntil) return;
+      final a = m.args.first;
+      setState(() {
+        if (mt!.group(3) == 'on') {
+          c.gateOn = (a is int ? a : (a is double ? a.round() : 0)) != 0;
+        } else if (a is double) {
+          c.gateThr = a.clamp(0.0, 1.0);
+        }
+      });
+      return;
+    }
+
+    // 컴프(다이내믹) on/threshold
+    mt = _dyn.firstMatch(m.address);
+    if (mt != null) {
+      final c = _find(mt.group(1)!, int.parse(mt.group(2)!));
+      if (c == null) return;
+      c.eqLoaded = true;
+      if (nowMs() < c.echoMuteUntil) return;
+      final a = m.args.first;
+      setState(() {
+        if (mt!.group(3) == 'on') {
+          c.dynOn = (a is int ? a : (a is double ? a.round() : 0)) != 0;
+        } else if (a is double) {
+          c.dynThr = a.clamp(0.0, 1.0);
+        }
+      });
+      return;
+    }
+
     if (m.address == '/main/st/mix/fader' && m.args.first is double) {
+      if (nowMs() < _mainEchoMuteUntil) return; // 방금 조작한 메인 → echo 무시
       setState(() => mainFader = (m.args.first as double).clamp(0.0, 1.0));
     } else if (m.address == '/main/st/mix/on') {
       final a = m.args.first;
@@ -601,22 +755,26 @@ class _MixerScreenState extends State<MixerScreen> {
   // ===== 조작 (앱→믹서: 사용자가 만질 때만) =====
   void _setFader(Ch c, double v) {
     setState(() => c.fad = v.clamp(0.0, 1.0));
+    c.echoMuteUntil = nowMs() + 250; // 직후 250ms는 콘솔 echo 무시(드래그 내내 자동 연장)
     _send(c.faderAddr, [c.fad]);
   }
 
   void _setPan(Ch c, double v) {
     setState(() => c.pan = v.clamp(0.0, 1.0));
+    c.echoMuteUntil = nowMs() + 250;
     _send('${c.base}/mix/pan', [c.pan]);
   }
 
   void _toggleMute(Ch c) {
     final o = !c.on;
     setState(() => c.on = o);
+    c.echoMuteUntil = nowMs() + 250;
     _send(c.onAddr, [o ? 1 : 0]);
   }
 
   void _setGain(Ch c, double db) {
     setState(() => c.gain = db.clamp(c.gainMin, c.gainMax));
+    c.echoMuteUntil = nowMs() + 250;
     // ⚠️ X32 게인/트림은 OSC에서 0.0~1.0 정규화 값(0=최소dB, 1=최대dB)이다.
     // dB를 그대로 보내면 1 이상은 콘솔이 최대(+60dB)로 클램프 → 게인 폭주/하울링.
     final norm = (c.gain - c.gainMin) / (c.gainMax - c.gainMin);
@@ -632,6 +790,7 @@ class _MixerScreenState extends State<MixerScreen> {
 
   void _setMain(double v) {
     setState(() => mainFader = v.clamp(0.0, 1.0));
+    _mainEchoMuteUntil = nowMs() + 250;
     _send('/main/st/mix/fader', [mainFader]);
   }
 
@@ -642,6 +801,8 @@ class _MixerScreenState extends State<MixerScreen> {
   }
 
   void sendEqBand(Ch c, int i) {
+    if (!c.eqLoaded) return; // 콘솔 현재값을 받기 전엔 push 금지(가짜 기본값으로 콘솔 EQ 덮어쓰기 방지)
+    c.echoMuteUntil = nowMs() + 250; // 조작 직후 echo 무시(EQ 드래그 떨림 방지)
     final b = c.eq[i];
     final band = '${c.base}/eq/${i + 1}';
     _send('$band/type', [b.t]);
@@ -650,13 +811,23 @@ class _MixerScreenState extends State<MixerScreen> {
     _send('$band/q', [b.q]);
   }
 
-  void sendEqOn(Ch c) => _send('${c.base}/eq/on', [c.eqon ? 1 : 0]);
+  void sendEqOn(Ch c) {
+    if (!c.eqLoaded) return;
+    c.echoMuteUntil = nowMs() + 250;
+    _send('${c.base}/eq/on', [c.eqon ? 1 : 0]);
+  }
+
   void sendGate(Ch c) {
+    if (!c.eqLoaded) return;
+    c.echoMuteUntil = nowMs() + 250;
     _send('${c.base}/gate/on', [c.gateOn ? 1 : 0]);
     _send('${c.base}/gate/thr', [c.gateThr]);
   }
 
   void sendDyn(Ch c) {
+    if (c.kind != 'ch' && c.kind != 'bus') return; // 컴프(dyn)는 /ch·/bus에만 존재
+    if (!c.eqLoaded) return;
+    c.echoMuteUntil = nowMs() + 250;
     _send('${c.base}/dyn/on', [c.dynOn ? 1 : 0]);
     _send('${c.base}/dyn/thr', [c.dynThr]);
   }
@@ -669,6 +840,7 @@ class _MixerScreenState extends State<MixerScreen> {
   }
 
   void _openDetail(Ch c) {
+    _queryDetail(c); // 상세를 열 때 콘솔의 EQ/게이트/컴프 현재값을 읽어온다
     Navigator.of(context).push(MaterialPageRoute(
       builder: (_) => DetailPage(ch: c, mixer: this),
       fullscreenDialog: true,
@@ -1392,28 +1564,32 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
               )),
           const SizedBox(height: 12),
         ],
-        _sectBox(
-          title: 'DYNAMICS',
-          child: Row(
-            children: [
-              Expanded(child: _dynCol('GATE', c.gateOn, () {
-                setState(() => c.gateOn = !c.gateOn);
-                widget.mixer.sendGate(c);
-              }, c.gateThr, (v) {
-                setState(() => c.gateThr = v.clamp(0.0, 1.0));
-                widget.mixer.sendGate(c);
-              })),
-              const SizedBox(width: 12),
-              Expanded(child: _dynCol('COMP', c.dynOn, () {
-                setState(() => c.dynOn = !c.dynOn);
-                widget.mixer.sendDyn(c);
-              }, c.dynThr, (v) {
-                setState(() => c.dynThr = v.clamp(0.0, 1.0));
-                widget.mixer.sendDyn(c);
-              })),
-            ],
+        // 게이트는 /ch에만, 컴프는 /ch·/bus에만 존재한다 — 없는 타입(AUX/FX)에선 섹션째 숨겨 '먹통 토글' 방지
+        if (c.kind == 'ch' || c.kind == 'bus')
+          _sectBox(
+            title: 'DYNAMICS',
+            child: Row(
+              children: [
+                if (c.kind == 'ch') ...[
+                  Expanded(child: _dynCol('GATE', c.gateOn, () {
+                    setState(() => c.gateOn = !c.gateOn);
+                    widget.mixer.sendGate(c);
+                  }, c.gateThr, (v) {
+                    setState(() => c.gateThr = v.clamp(0.0, 1.0));
+                    widget.mixer.sendGate(c);
+                  })),
+                  const SizedBox(width: 12),
+                ],
+                Expanded(child: _dynCol('COMP', c.dynOn, () {
+                  setState(() => c.dynOn = !c.dynOn);
+                  widget.mixer.sendDyn(c);
+                }, c.dynThr, (v) {
+                  setState(() => c.dynThr = v.clamp(0.0, 1.0));
+                  widget.mixer.sendDyn(c);
+                })),
+              ],
+            ),
           ),
-        ),
       ],
     );
   }
@@ -1430,7 +1606,8 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
           ],
         ),
         const SizedBox(height: 8),
-        _knob(label: 'THR', frac: thr, valText: '${(-60 + thr * 60).round()}dB', onDrag: (dy, h) => onThr(thr - dy / h)),
+        // 게이트 thr 범위는 -80~0dB, 컴프는 -60~0dB (X32 표준)
+        _knob(label: 'THR', frac: thr, valText: '${((label == 'GATE' ? -80.0 : -60.0) * (1 - thr)).round()}dB', onDrag: (dy, h) => onThr(thr - dy / h)),
       ],
     );
   }
@@ -1559,17 +1736,20 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
         best = i;
       }
     }
-    setState(() => eqSel = best);
-    _eqMove(p, bc);
+    setState(() => eqSel = best); // 선택만 — 실제 f/g 이동은 드래그(onPanUpdate)에서만(실수 탭 한 번으로 EQ 덮어쓰기 방지)
   }
 
   void _eqMove(Offset p, BoxConstraints bc) {
     final w = bc.maxWidth, h = bc.maxHeight;
     final b = c.eq[eqSel];
     b.f = (p.dx / w).clamp(0.0, 1.0);
-    final denom = (h / 2 - 8).clamp(1.0, double.infinity); // 짧은 화면서 분모 0/음수 방지(드래그 반전 차단)
-    final db = ((h / 2 - p.dy) / denom) * 18;
-    b.g = eqXfromG(db.clamp(-15.0, 15.0));
+    // LCut(0)/HCut(5)는 게인이 의미 없는 컷 필터 → 세로 드래그로 게인을 바꾸지 않는다(무의미한 콘솔 전송 방지).
+    final isCut = b.t == 0 || b.t == 5;
+    if (!isCut) {
+      final denom = (h / 2 - 8).clamp(1.0, double.infinity); // 짧은 화면서 분모 0/음수 방지(드래그 반전 차단)
+      final db = ((h / 2 - p.dy) / denom) * 18;
+      b.g = eqXfromG(db.clamp(-15.0, 15.0));
+    }
     widget.mixer.sendEqBand(c, eqSel);
     setState(() {});
   }
