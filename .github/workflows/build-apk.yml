@@ -1,0 +1,54 @@
+name: Build APK
+
+# 코드를 올리면(push) 또는 수동 실행(Run workflow)하면
+# 클라우드에서 안드로이드 APK(설치파일)를 자동으로 만들어 줍니다.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 소스 가져오기
+        uses: actions/checkout@v4
+
+      - name: Java(JDK 17) 준비
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Flutter 준비
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: 프로젝트 골격 생성 + 우리 소스 덮어쓰기
+        run: |
+          set -e
+          flutter create --project-name mixcontrol --org ai.byeori --platforms android build_app
+          cp app_lib/main.dart   build_app/lib/main.dart
+          cp app_pubspec.yaml    build_app/pubspec.yaml
+          # 네트워크(UDP) 권한 보장 — release APK 의 메인 매니페스트에 INTERNET 권한 주입
+          MANIFEST=build_app/android/app/src/main/AndroidManifest.xml
+          if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
+            sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' "$MANIFEST"
+          fi
+          # 런처에 표시될 앱 이름
+          sed -i 's#android:label="[^"]*"#android:label="X32 MixControl"#' "$MANIFEST"
+
+      - name: APK 빌드(release)
+        run: |
+          set -e
+          cd build_app
+          flutter pub get
+          flutter build apk --release
+
+      - name: APK 업로드(다운로드용 결과물)
+        uses: actions/upload-artifact@v4
+        with:
+          name: x32-mixcontrol-apk
+          path: build_app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
