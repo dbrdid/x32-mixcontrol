@@ -614,6 +614,9 @@ class _MixerScreenState extends State<MixerScreen> {
     }
   }
 
+  // ▲/▼ 버튼: 1dB씩 정밀 조절(현재값을 정수로 스냅 후 ±1).
+  void _stepGain(Ch c, int d) => _setGain(c, (c.gain.round() + d).toDouble());
+
   void _setMain(double v) {
     setState(() => mainFader = v.clamp(0.0, 1.0));
     _send('/main/st/mix/fader', [mainFader]);
@@ -877,33 +880,50 @@ class _MixerScreenState extends State<MixerScreen> {
 
   Widget _gainSlider(Ch c, bool compact) {
     final span = c.gainMax - c.gainMin;
-    // 세로로 길게 → 위아래 조절이 자연스럽고 쉽게. 위젯 높이의 2배를 끌어야 풀레인지 = 천천히 정밀하게.
-    final h = compact ? 64.0 : 104.0;
-    return GestureDetector(
-      onVerticalDragUpdate: (d) => _setGain(c, c.gain - d.delta.dy / (h * 2) * span),
-      child: SizedBox(
-        height: h,
-        child: CustomPaint(
-          painter: GainPainter((c.gain - c.gainMin) / span),
-          child: Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Padding(
-                  padding: EdgeInsets.only(top: 5),
-                  child: Text('GAIN', style: TextStyle(fontSize: 8, fontWeight: FontWeight.w800, color: Color(0xFF9A8348), letterSpacing: 0.5)),
+    // ▲/▼ 버튼 = 1dB씩 정밀(메인 조작), 가운데 드래그 = 빠른 대략 이동(둔감).
+    final btnH = compact ? 24.0 : 28.0;
+    final dragH = compact ? 40.0 : 56.0;
+    Widget stepBtn(IconData icon, int d) => GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => _stepGain(c, d),
+          child: Container(
+            height: btnH,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: const Color(0xFF2A2410),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: const Color(0xFF4A3D1A)),
+            ),
+            child: Icon(icon, size: btnH - 8, color: const Color(0xFFE0A030)),
+          ),
+        );
+    return Column(
+      children: [
+        stepBtn(Icons.keyboard_arrow_up, 1),
+        const SizedBox(height: 3),
+        GestureDetector(
+          onVerticalDragUpdate: (d) => _setGain(c, c.gain - d.delta.dy / (dragH * 3) * span),
+          child: SizedBox(
+            height: dragH,
+            child: CustomPaint(
+              painter: GainPainter((c.gain - c.gainMin) / span),
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Text('GAIN', style: TextStyle(fontSize: 7, fontWeight: FontWeight.w800, color: Color(0xFF9A8348), letterSpacing: 0.5)),
+                    Text('${c.gain >= 0 ? '+' : ''}${c.gain.round()}dB',
+                        style: const TextStyle(
+                            fontSize: 14, fontWeight: FontWeight.w800, color: Color(0xFFE0A030), fontFeatures: [FontFeature('tnum')])),
+                  ],
                 ),
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 5),
-                  child: Text('${c.gain >= 0 ? '+' : ''}${c.gain.round()}dB',
-                      style: const TextStyle(
-                          fontSize: 13, fontWeight: FontWeight.w800, color: Color(0xFFE0A030), fontFeatures: [FontFeature('tnum')])),
-                ),
-              ],
+              ),
             ),
           ),
         ),
-      ),
+        const SizedBox(height: 3),
+        stepBtn(Icons.keyboard_arrow_down, -1),
+      ],
     );
   }
 
