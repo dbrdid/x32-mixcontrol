@@ -378,10 +378,14 @@ class _MixerScreenState extends State<MixerScreen> {
     _send('/main/st/mix/on');
   }
 
+  // 미터 구독: /batchsubscribe(별칭)로 여러 뱅크를 동시에 받는다(Cue-View·asm-graphics 등 검증된 패턴).
+  //  형식: /batchsubscribe ,ssiii <별칭> <경로> <i0> <i1> <tf>.  tf=2 → 약 100ms 간격.
+  //  별칭을 경로 그대로 주면 응답이 그 주소로 와서 어느 뱅크인지 명확해진다. 10초 만료 → _renew(8초)에서 재전송.
+  //  /meters/1(96): [0..31]=입력채널 레벨 | /meters/2(49): [0..15]=bus, [22]=main L, [23]=main R | /meters/3(22): [6..13]=aux ret, [14..21]=fx ret
   void _subMeters() {
-    _send('/meters', ['/meters/1', 2]); // 32 입력 채널
-    _send('/meters', ['/meters/2', 2]); // 16 mix bus + main LR
-    _send('/meters', ['/meters/3', 2]); // 6 aux send + 8 aux return + 8 fx return
+    _send('/batchsubscribe', ['/meters/1', '/meters/1', 0, 0, 2]);
+    _send('/batchsubscribe', ['/meters/2', '/meters/2', 0, 0, 2]);
+    _send('/batchsubscribe', ['/meters/3', '/meters/3', 0, 0, 2]);
   }
 
   Ch? _find(String kind, int n) {
@@ -406,7 +410,7 @@ class _MixerScreenState extends State<MixerScreen> {
     if (m == null || m.args.isEmpty) return;
 
     if (m.args.first is Uint8List) {
-      _onMeters(m.args.first as Uint8List);
+      _onMeters(m.address, m.args.first as Uint8List);
       return;
     }
 
@@ -439,7 +443,8 @@ class _MixerScreenState extends State<MixerScreen> {
       setState(() {
         if (mt!.group(3) == 'name' && a is String) {
           c.name = a.trim();
-        } else if (mt.group(3) == 'color') {
+        } else if (mt!.group(3) == 'color') {
+          // (mt는 클로저에 캡처된 가변 변수라 promote 불가 → 명시적으로 mt! 단언)
           c.color = a is int ? a : (a is double ? a.round() : 0);
         }
       });
@@ -472,7 +477,7 @@ class _MixerScreenState extends State<MixerScreen> {
     }
   }
 
-  void _onMeters(Uint8List blob) {
+  void _onMeters(String addr, Uint8List blob) {
     if (blob.length < 8) return;
     final bd = ByteData.sublistView(blob);
     final count = bd.getInt32(0, Endian.little);
@@ -483,7 +488,12 @@ class _MixerScreenState extends State<MixerScreen> {
       if (v >= 1.0) c.clipUntil = 1.5;
     }
 
-    if (count >= 90) {
+    // 어느 뱅크인지: 응답 주소(별칭) 우선, 없으면 값 개수로 판별. /meters/1=96, /meters/2=49, /meters/3=22.
+    final inputsBank = addr.endsWith('/1') || count >= 80;
+    final busMainBank = !inputsBank && (addr.endsWith('/2') || (count >= 30 && count < 80));
+    final auxFxBank = !inputsBank && !busMainBank && (addr.endsWith('/3') || (count >= 10 && count < 30));
+
+    if (inputsBank) {
       // /meters/1 : 입력 채널 32
       setState(() {
         for (int i = 0; i < 32; i++) {
@@ -491,7 +501,7 @@ class _MixerScreenState extends State<MixerScreen> {
           up(inputs[i], f(i));
         }
       });
-    } else if (count >= 40) {
+    } else if (busMainBank) {
       // /meters/2 : 16 bus master + [22]=main L, [23]=main R
       setState(() {
         for (int i = 0; i < 16; i++) {
@@ -506,7 +516,7 @@ class _MixerScreenState extends State<MixerScreen> {
           if (mainL >= 1.0 || mainR >= 1.0) mainClip = 1.5;
         }
       });
-    } else if (count >= 20) {
+    } else if (auxFxBank) {
       // /meters/3 : [0..5]aux send, [6..13]aux return, [14..21]fx return
       setState(() {
         for (int i = 0; i < 8; i++) {
@@ -752,70 +762,76 @@ class _MixerScreenState extends State<MixerScreen> {
   }
 
   Widget _strip(Ch c) {
-    final clip = c.clipUntil > 0;
-    return Container(
-      decoration: BoxDecoration(
-        color: const Color(0xFF1A1F25),
-        borderRadius: BorderRadius.circular(13),
-        border: Border.all(color: const Color(0xFF20262E)),
-      ),
-      padding: const EdgeInsets.fromLTRB(6, 12, 6, 14),
-      child: Column(
-        children: [
-          Container(
-            height: 5,
-            margin: const EdgeInsets.symmetric(horizontal: 2),
-            decoration: BoxDecoration(color: chColor(c.color), borderRadius: BorderRadius.circular(4)),
-          ),
-          const SizedBox(height: 5),
-          GestureDetector(
-            onTap: () => _openDetail(c),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Container(
-                  width: 7,
-                  height: 7,
-                  margin: const EdgeInsets.only(right: 4),
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: c.lvl > 0.02 ? const Color(0xFF34C759) : const Color(0xFF2A2F36),
-                  ),
-                ),
-                Flexible(
-                  child: Text(c.display,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: Colors.white)),
-                ),
-              ],
+    return LayoutBuilder(builder: (ctx, bc) {
+      final clip = c.clipUntil > 0;
+      // 세로 공간이 좁으면(폰 가로 등) 컴팩트 — 고정요소를 줄여 페이더가 음수/0이 되는 overflow를 막는다.
+      final compact = bc.maxHeight.isFinite && bc.maxHeight < 500;
+      final gap = compact ? 3.0 : 5.0;
+      final gap2 = compact ? 3.0 : 6.0;
+      return Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFF1A1F25),
+          borderRadius: BorderRadius.circular(13),
+          border: Border.all(color: const Color(0xFF20262E)),
+        ),
+        padding: EdgeInsets.fromLTRB(6, compact ? 7 : 12, 6, compact ? 8 : 14),
+        child: Column(
+          children: [
+            Container(
+              height: compact ? 4 : 5,
+              margin: const EdgeInsets.symmetric(horizontal: 2),
+              decoration: BoxDecoration(color: chColor(c.color), borderRadius: BorderRadius.circular(4)),
             ),
-          ),
-          if (c.hasGain) ...[
-            const SizedBox(height: 5),
-            _gainSlider(c),
+            SizedBox(height: gap),
+            GestureDetector(
+              onTap: () => _openDetail(c),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Container(
+                    width: 7,
+                    height: 7,
+                    margin: const EdgeInsets.only(right: 4),
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: c.lvl > 0.02 ? const Color(0xFF34C759) : const Color(0xFF2A2F36),
+                    ),
+                  ),
+                  Flexible(
+                    child: Text(c.display,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: Colors.white)),
+                  ),
+                ],
+              ),
+            ),
+            if (c.hasGain) ...[
+              SizedBox(height: gap),
+              _gainSlider(c, compact),
+            ],
+            SizedBox(height: gap),
+            _dbBox(faderDb(c.fad)),
+            SizedBox(height: gap2),
+            Expanded(child: RepaintBoundary(child: _faderMeter(c))),
+            const SizedBox(height: 4),
+            _pkBox('PK', c.pk, clip),
+            SizedBox(height: gap2),
+            _panBar(c, compact),
+            SizedBox(height: gap2),
+            _muteBtn(c.on, () => _toggleMute(c)),
           ],
-          const SizedBox(height: 5),
-          _dbBox(faderDb(c.fad)),
-          const SizedBox(height: 6),
-          Expanded(child: _faderMeter(c)),
-          const SizedBox(height: 4),
-          _pkBox('PK', c.pk, clip),
-          const SizedBox(height: 6),
-          _panBar(c),
-          const SizedBox(height: 6),
-          _muteBtn(c.on, () => _toggleMute(c)),
-        ],
-      ),
-    );
+        ),
+      );
+    });
   }
 
-  Widget _gainSlider(Ch c) {
+  Widget _gainSlider(Ch c, bool compact) {
     final span = c.gainMax - c.gainMin;
     return GestureDetector(
       onVerticalDragUpdate: (d) => _setGain(c, c.gain - d.delta.dy / 84 * span),
       child: SizedBox(
-        height: 64,
+        height: compact ? 44 : 64,
         child: CustomPaint(
           painter: GainPainter((c.gain - c.gainMin) / span),
           child: Center(
@@ -890,7 +906,8 @@ class _MixerScreenState extends State<MixerScreen> {
     );
   }
 
-  Widget _panBar(Ch c) {
+  Widget _panBar(Ch c, bool compact) {
+    final ph = compact ? 22.0 : 30.0;
     return GestureDetector(
       onVerticalDragUpdate: (d) {
         double v = c.pan - d.delta.dy / 200;
@@ -900,9 +917,9 @@ class _MixerScreenState extends State<MixerScreen> {
       child: Column(
         children: [
           CustomPaint(
-            size: const Size(double.infinity, 30),
+            size: Size(double.infinity, ph),
             painter: PanPainter(c.pan),
-            child: const SizedBox(height: 30, width: double.infinity),
+            child: SizedBox(height: ph, width: double.infinity),
           ),
           Text(panLabel(c.pan), style: const TextStyle(fontSize: 9, color: Color(0xFF8A94A0), fontFeatures: [FontFeature('tnum')])),
         ],
@@ -1218,10 +1235,17 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
                     ],
                   ),
                   const Spacer(),
-                  FilledButton(
-                    style: FilledButton.styleFrom(backgroundColor: const Color(0xFF3A4654), foregroundColor: Colors.white),
+                  FilledButton.icon(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF22D3EE),
+                      foregroundColor: const Color(0xFF06222A),
+                      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
+                      elevation: 3,
+                    ),
                     onPressed: () => Navigator.of(context).pop(),
-                    child: const Text('닫기 ✕', style: TextStyle(fontWeight: FontWeight.w700)),
+                    icon: const Icon(Icons.close, size: 20),
+                    label: const Text('닫기', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
                   ),
                 ],
               ),
@@ -1459,7 +1483,8 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
     final w = bc.maxWidth, h = bc.maxHeight;
     final b = c.eq[eqSel];
     b.f = (p.dx / w).clamp(0.0, 1.0);
-    final db = ((h / 2 - p.dy) / (h / 2 - 8)) * 18;
+    final denom = (h / 2 - 8).clamp(1.0, double.infinity); // 짧은 화면서 분모 0/음수 방지(드래그 반전 차단)
+    final db = ((h / 2 - p.dy) / denom) * 18;
     b.g = eqXfromG(db.clamp(-15.0, 15.0));
     widget.mixer.sendEqBand(c, eqSel);
     setState(() {});
@@ -1584,14 +1609,16 @@ class EqPainter extends CustomPainter {
       final y = db2y(db);
       canvas.drawLine(Offset(0, y), Offset(w, y), Paint()..color = db == 0 ? const Color(0xFF33414E) : const Color(0xFF161D24));
     }
-    if (connected) {
+    // RTA(실시간 스펙트럼): 채널의 실측 레벨(ch.lvl)에 반응한다. 무신호면 막대를 그리지 않아
+    // '예시 그래프'처럼 보이지 않는다(시간 변동은 미세한 질감으로만, 크기는 실측이 지배).
+    final amp = meterFrac(ch.lvl);
+    if (connected && amp > 0.02) {
       const N = 32;
       for (int i = 0; i < N; i++) {
         final fx = (i + 0.5) / N;
         final fhz = 20 * math.pow(1000, fx).toDouble();
-        double lv = 0.4 + 0.3 * math.sin(t * 1.7 + i * 0.7) + 0.2 * math.sin(t * 4.3 + i * 1.9) + 0.1 * math.sin(t * 9 + i * 0.4);
-        // 실제 채널 레벨(c.lvl)을 반영 — 신호가 있어야 RTA가 살아남 (라이브)
-        lv = math.max(0.0, lv * (1 - fx * 0.4)) * (0.1 + meterFrac(ch.lvl) * 1.2);
+        final tex = 0.85 + 0.15 * math.sin(t * 3.0 + i * 0.8); // ±15% 질감
+        double lv = amp * tex * (1 - fx * 0.35);
         if (ch.eqon) {
           double g = 0;
           for (final b in ch.eq) {
