@@ -232,9 +232,14 @@ class Ch {
   double dynThr = 0.45;
   double lvl = 0, pk = 0, clipUntil = 0;
   Ch(this.kind, this.n, {this.fad = 0.0});
-  String get base => '/$kind/${nn(n)}';
+  bool get isDca => kind == 'dca';
+  // DCA는 그룹 마스터라 주소가 다르다: /dca/N (패딩 없음, /mix 없음). 나머지는 /kind/NN/mix/...
+  String get base => isDca ? '/dca/$n' : '/$kind/${nn(n)}';
+  String get faderAddr => isDca ? '$base/fader' : '$base/mix/fader';
+  String get onAddr => isDca ? '$base/on' : '$base/mix/on';
   bool get hasGain => kind == 'ch' || kind == 'auxin';
   bool get hasMeter => kind == 'ch';
+  bool get hasPan => !isDca; // DCA는 팬 없음(그룹 마스터)
   String get fallbackName {
     switch (kind) {
       case 'ch':
@@ -243,6 +248,8 @@ class Ch {
         return 'AUX ${nn(n)}';
       case 'fxrtn':
         return 'FX ${nn(n)}';
+      case 'dca':
+        return 'DCA $n';
       default:
         return 'BUS ${nn(n)}';
     }
@@ -273,7 +280,7 @@ class _MixerScreenState extends State<MixerScreen> {
   Timer? _renew, _decay;
   bool _connected = false;
 
-  late final List<Ch> inputs, auxins, fxrtns, buses, all;
+  late final List<Ch> inputs, auxins, fxrtns, buses, dcas, all;
   late final List<Layer> layers;
   int layerIdx = 0;
 
@@ -285,6 +292,8 @@ class _MixerScreenState extends State<MixerScreen> {
   final _cfg = RegExp(r'^/(ch|auxin|fxrtn|bus)/(\d\d)/config/(name|color)$');
   final _ha = RegExp(r'^/headamp/(\d\d\d)/gain$');
   final _trim = RegExp(r'^/auxin/(\d\d)/preamp/trim$');
+  final _dca = RegExp(r'^/dca/([1-8])/(fader|on)$');
+  final _dcaCfg = RegExp(r'^/dca/([1-8])/config/(name|color)$');
 
   @override
   void initState() {
@@ -293,7 +302,8 @@ class _MixerScreenState extends State<MixerScreen> {
     auxins = List.generate(8, (i) => Ch('auxin', i + 1));
     fxrtns = List.generate(8, (i) => Ch('fxrtn', i + 1));
     buses = List.generate(16, (i) => Ch('bus', i + 1));
-    all = [...inputs, ...auxins, ...fxrtns, ...buses];
+    dcas = List.generate(8, (i) => Ch('dca', i + 1, fad: 0.75));
+    all = [...inputs, ...auxins, ...fxrtns, ...buses, ...dcas];
     layers = [
       Layer('CH', '1–8', inputs.sublist(0, 8)),
       Layer('CH', '9–16', inputs.sublist(8, 16)),
@@ -303,6 +313,7 @@ class _MixerScreenState extends State<MixerScreen> {
       Layer('FX', 'RTN', fxrtns),
       Layer('BUS', '1–8', buses.sublist(0, 8)),
       Layer('BUS', '9–16', buses.sublist(8, 16)),
+      Layer('DCA', '1–8', dcas),
     ];
   }
 
@@ -363,9 +374,9 @@ class _MixerScreenState extends State<MixerScreen> {
 
   void _queryAll() {
     for (final c in all) {
-      _send('${c.base}/mix/fader');
-      _send('${c.base}/mix/on');
-      _send('${c.base}/mix/pan');
+      _send(c.faderAddr);
+      _send(c.onAddr);
+      if (c.hasPan) _send('${c.base}/mix/pan');
       _send('${c.base}/config/name');
       _send('${c.base}/config/color');
       if (c.kind == 'ch') {
@@ -398,6 +409,8 @@ class _MixerScreenState extends State<MixerScreen> {
         return (n >= 1 && n <= 8) ? fxrtns[n - 1] : null;
       case 'bus':
         return (n >= 1 && n <= 16) ? buses[n - 1] : null;
+      case 'dca':
+        return (n >= 1 && n <= 8) ? dcas[n - 1] : null;
     }
     return null;
   }
@@ -466,6 +479,38 @@ class _MixerScreenState extends State<MixerScreen> {
       if (c != null && m.args.first is double) {
         setState(() => c.gain = m.args.first as double);
       }
+      return;
+    }
+
+    // DCA 그룹 마스터: /dca/N/fader · /dca/N/on
+    mt = _dca.firstMatch(m.address);
+    if (mt != null) {
+      final c = _find('dca', int.parse(mt.group(1)!));
+      if (c == null) return;
+      final a = m.args.first;
+      setState(() {
+        if (mt!.group(2) == 'fader') {
+          if (a is double) c.fad = a.clamp(0.0, 1.0);
+        } else {
+          c.on = (a is int ? a : (a is double ? a.round() : 1)) != 0;
+        }
+      });
+      return;
+    }
+
+    // DCA 이름/색상: /dca/N/config/name · /dca/N/config/color
+    mt = _dcaCfg.firstMatch(m.address);
+    if (mt != null) {
+      final c = _find('dca', int.parse(mt.group(1)!));
+      if (c == null) return;
+      final a = m.args.first;
+      setState(() {
+        if (mt!.group(2) == 'name' && a is String) {
+          c.name = a.trim();
+        } else if (mt!.group(2) == 'color') {
+          c.color = a is int ? a : (a is double ? a.round() : 0);
+        }
+      });
       return;
     }
 
@@ -546,7 +591,7 @@ class _MixerScreenState extends State<MixerScreen> {
   // ===== 조작 (앱→믹서: 사용자가 만질 때만) =====
   void _setFader(Ch c, double v) {
     setState(() => c.fad = v.clamp(0.0, 1.0));
-    _send('${c.base}/mix/fader', [c.fad]);
+    _send(c.faderAddr, [c.fad]);
   }
 
   void _setPan(Ch c, double v) {
@@ -557,7 +602,7 @@ class _MixerScreenState extends State<MixerScreen> {
   void _toggleMute(Ch c) {
     final o = !c.on;
     setState(() => c.on = o);
-    _send('${c.base}/mix/on', [o ? 1 : 0]);
+    _send(c.onAddr, [o ? 1 : 0]);
   }
 
   void _setGain(Ch c, double db) {
@@ -722,7 +767,7 @@ class _MixerScreenState extends State<MixerScreen> {
   Widget _layerBar() {
     final items = <Widget>[];
     for (int i = 0; i < layers.length; i++) {
-      if (i == 4) {
+      if (i == 4 || layers[i].label == 'DCA') {
         items.add(Container(
           margin: const EdgeInsets.fromLTRB(4, 6, 4, 6),
           height: 1,
@@ -784,7 +829,7 @@ class _MixerScreenState extends State<MixerScreen> {
             ),
             SizedBox(height: gap),
             GestureDetector(
-              onTap: () => _openDetail(c),
+              onTap: c.isDca ? null : () => _openDetail(c),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
@@ -814,10 +859,14 @@ class _MixerScreenState extends State<MixerScreen> {
             _dbBox(faderDb(c.fad)),
             SizedBox(height: gap2),
             Expanded(child: RepaintBoundary(child: _faderMeter(c))),
-            const SizedBox(height: 4),
-            _pkBox('PK', c.pk, clip),
-            SizedBox(height: gap2),
-            _panBar(c, compact),
+            if (!c.isDca) ...[
+              const SizedBox(height: 4),
+              _pkBox('PK', c.pk, clip),
+            ],
+            if (c.hasPan) ...[
+              SizedBox(height: gap2),
+              _panBar(c, compact),
+            ],
             SizedBox(height: gap2),
             _muteBtn(c.on, () => _toggleMute(c)),
           ],
@@ -828,10 +877,12 @@ class _MixerScreenState extends State<MixerScreen> {
 
   Widget _gainSlider(Ch c, bool compact) {
     final span = c.gainMax - c.gainMin;
+    // 세로로 길게 → 위아래 조절이 자연스럽고 쉽게. 위젯 높이의 2배를 끌어야 풀레인지 = 천천히 정밀하게.
+    final h = compact ? 64.0 : 104.0;
     return GestureDetector(
-      onVerticalDragUpdate: (d) => _setGain(c, c.gain - d.delta.dy / 84 * span),
+      onVerticalDragUpdate: (d) => _setGain(c, c.gain - d.delta.dy / (h * 2) * span),
       child: SizedBox(
-        height: compact ? 44 : 64,
+        height: h,
         child: CustomPaint(
           painter: GainPainter((c.gain - c.gainMin) / span),
           child: Center(
@@ -839,14 +890,14 @@ class _MixerScreenState extends State<MixerScreen> {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 const Padding(
-                  padding: EdgeInsets.only(top: 3),
-                  child: Text('GAIN', style: TextStyle(fontSize: 7, fontWeight: FontWeight.w800, color: Color(0xFF9A8348))),
+                  padding: EdgeInsets.only(top: 5),
+                  child: Text('GAIN', style: TextStyle(fontSize: 8, fontWeight: FontWeight.w800, color: Color(0xFF9A8348), letterSpacing: 0.5)),
                 ),
                 Padding(
-                  padding: const EdgeInsets.only(bottom: 3),
+                  padding: const EdgeInsets.only(bottom: 5),
                   child: Text('${c.gain >= 0 ? '+' : ''}${c.gain.round()}dB',
                       style: const TextStyle(
-                          fontSize: 11, fontWeight: FontWeight.w800, color: Color(0xFFE0A030), fontFeatures: [FontFeature('tnum')])),
+                          fontSize: 13, fontWeight: FontWeight.w800, color: Color(0xFFE0A030), fontFeatures: [FontFeature('tnum')])),
                 ),
               ],
             ),
