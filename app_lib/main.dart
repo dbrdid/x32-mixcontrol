@@ -337,6 +337,13 @@ class _MixerScreenState extends State<MixerScreen> {
       _queryAll();
       _send('/xremote');
       _subMeters();
+      // UDP 응답 유실 대비 — 연결 직후 몇 번 더 조회해서 누락된 이름/색상/값을 메운다.
+      // (한 번만 조회하면 유실된 채널이 매번 달라져 "이름이 바뀌거나 리셋"되는 것처럼 보임)
+      for (final ms in [400, 1200, 2500]) {
+        Timer(Duration(milliseconds: ms), () {
+          if (_connected) _queryAll();
+        });
+      }
       _renew = Timer.periodic(const Duration(seconds: 8), (_) {
         _send('/xremote');
         _subMeters();

@@ -1,7 +1,7 @@
 name: mixcontrol
 description: X32 MixControl — unofficial remote for Behringer X32/M32 over OSC/UDP.
 publish_to: "none"
-version: 0.6.2+10
+version: 0.6.3+11
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
