@@ -468,7 +468,9 @@ class _MixerScreenState extends State<MixerScreen> {
     if (mt != null) {
       final idx = int.parse(mt.group(1)!);
       if (idx >= 0 && idx < 32 && m.args.first is double) {
-        setState(() => inputs[idx].gain = m.args.first as double);
+        final ch = inputs[idx];
+        // 0~1 정규화 → 실제 dB
+        setState(() => ch.gain = (m.args.first as double) * (ch.gainMax - ch.gainMin) + ch.gainMin);
       }
       return;
     }
@@ -477,7 +479,8 @@ class _MixerScreenState extends State<MixerScreen> {
     if (mt != null) {
       final c = _find('auxin', int.parse(mt.group(1)!));
       if (c != null && m.args.first is double) {
-        setState(() => c.gain = m.args.first as double);
+        // 0~1 정규화 → 실제 dB
+        setState(() => c.gain = (m.args.first as double) * (c.gainMax - c.gainMin) + c.gainMin);
       }
       return;
     }
@@ -607,10 +610,13 @@ class _MixerScreenState extends State<MixerScreen> {
 
   void _setGain(Ch c, double db) {
     setState(() => c.gain = db.clamp(c.gainMin, c.gainMax));
+    // ⚠️ X32 게인/트림은 OSC에서 0.0~1.0 정규화 값(0=최소dB, 1=최대dB)이다.
+    // dB를 그대로 보내면 1 이상은 콘솔이 최대(+60dB)로 클램프 → 게인 폭주/하울링.
+    final norm = (c.gain - c.gainMin) / (c.gainMax - c.gainMin);
     if (c.kind == 'ch') {
-      _send('/headamp/${(c.n - 1).toString().padLeft(3, '0')}/gain', [c.gain]);
+      _send('/headamp/${(c.n - 1).toString().padLeft(3, '0')}/gain', [norm]);
     } else if (c.kind == 'auxin') {
-      _send('${c.base}/preamp/trim', [c.gain]);
+      _send('${c.base}/preamp/trim', [norm]);
     }
   }
 
