@@ -45,9 +45,9 @@ jobs:
           # google_mobile_ads 5.x는 minSdk 23 필요 — build.gradle / build.gradle.kts 양쪽 대응
           for G in build_app/android/app/build.gradle build_app/android/app/build.gradle.kts; do
             if [ -f "$G" ]; then
-              sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' "$G"
-              sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' "$G"
-              sed -i 's/minSdkVersion = flutter.minSdkVersion/minSdkVersion = 23/' "$G"
+              sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' "$G"
+              sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/' "$G"
+              sed -i 's/minSdkVersion = flutter.minSdkVersion/minSdkVersion = 24/' "$G"
             fi
           done
 
