@@ -1,7 +1,7 @@
 name: mixcontrol
 description: X32 MixControl — unofficial remote for Behringer X32/M32 over OSC/UDP.
 publish_to: "none"
-version: 0.6.5+13
+version: 0.7.0+14
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -10,6 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.6
+  google_mobile_ads: ^5.3.1
 
 dev_dependencies:
   flutter_lints: ^4.0.0

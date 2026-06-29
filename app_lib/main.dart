@@ -11,8 +11,12 @@ import 'dart:ui' show FontFeature;
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
 
 const int kPort = 10023;
+// AdMob 배너 — 개발 중엔 구글 공식 테스트 광고 단위 ID(실광고를 개발자가 누르면 계정 정지 위험).
+// 런칭 직전 육양님의 실제 배너 단위 ID로 교체한다.
+const String kBannerAdUnitId = 'ca-app-pub-3940256099942544/6300978111';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -20,6 +24,7 @@ void main() {
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
   ]);
+  MobileAds.instance.initialize(); // AdMob 초기화(연결 전 배너 광고용)
   runApp(const X32App());
 }
 
@@ -285,6 +290,8 @@ class _MixerScreenState extends State<MixerScreen> {
   InternetAddress? _dest;
   Timer? _renew, _decay;
   bool _connected = false;
+  BannerAd? _ad;
+  bool _adLoaded = false;
 
   late final List<Ch> inputs, auxins, fxrtns, buses, dcas, all;
   late final List<Layer> layers;
@@ -326,6 +333,7 @@ class _MixerScreenState extends State<MixerScreen> {
       Layer('BUS', '9–16', buses.sublist(8, 16)),
       Layer('DCA', '1–8', dcas),
     ];
+    _loadAd();
   }
 
   List<Ch> get cur => layers[layerIdx].list;
@@ -333,8 +341,25 @@ class _MixerScreenState extends State<MixerScreen> {
   @override
   void dispose() {
     _disconnect();
+    _ad?.dispose();
     _ipCtrl.dispose();
     super.dispose();
+  }
+
+  void _loadAd() {
+    final ad = BannerAd(
+      adUnitId: kBannerAdUnitId,
+      size: AdSize.banner,
+      request: const AdRequest(),
+      listener: BannerAdListener(
+        onAdLoaded: (_) {
+          if (mounted) setState(() => _adLoaded = true);
+        },
+        onAdFailedToLoad: (ad, err) => ad.dispose(),
+      ),
+    );
+    _ad = ad;
+    ad.load();
   }
 
   // ===== 연결 =====
@@ -930,6 +955,16 @@ class _MixerScreenState extends State<MixerScreen> {
   }
 
   Widget _banner() {
+    // 광고 로드 완료 시 실제 AdMob 배너, 아직이면 placeholder. (둘 다 height 50으로 레이아웃 안정)
+    if (_adLoaded && _ad != null) {
+      return Container(
+        height: _ad!.size.height.toDouble(),
+        width: double.infinity,
+        alignment: Alignment.center,
+        color: const Color(0xFF191E24),
+        child: AdWidget(ad: _ad!),
+      );
+    }
     return Container(
       height: 50,
       alignment: Alignment.center,
@@ -946,7 +981,7 @@ class _MixerScreenState extends State<MixerScreen> {
             child: const Text('AD', style: TextStyle(fontSize: 10, fontWeight: FontWeight.w800, color: Color(0xFF0C0E12))),
           ),
           const SizedBox(width: 10),
-          const Text('배너 광고 영역 · 연결하면 사라집니다', style: TextStyle(fontSize: 13, color: Color(0xFF79828F))),
+          const Text('광고 불러오는 중 · 연결하면 사라집니다', style: TextStyle(fontSize: 13, color: Color(0xFF79828F))),
         ],
       ),
     );

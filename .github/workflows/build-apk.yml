@@ -38,6 +38,18 @@ jobs:
           fi
           # 런처에 표시될 앱 이름
           sed -i 's#android:label="[^"]*"#android:label="X32 MixControl"#' "$MANIFEST"
+          # AdMob App ID 주입 (테스트 App ID — 런칭 시 실제 App ID로 교체). application 자식으로 첫 <activity 앞에 삽입.
+          if ! grep -q 'com.google.android.gms.ads.APPLICATION_ID' "$MANIFEST"; then
+            sed -i 's#<activity#<meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="ca-app-pub-3940256099942544~3347511713"/>\n        <activity#' "$MANIFEST"
+          fi
+          # google_mobile_ads 5.x는 minSdk 23 필요 — build.gradle / build.gradle.kts 양쪽 대응
+          for G in build_app/android/app/build.gradle build_app/android/app/build.gradle.kts; do
+            if [ -f "$G" ]; then
+              sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' "$G"
+              sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' "$G"
+              sed -i 's/minSdkVersion = flutter.minSdkVersion/minSdkVersion = 23/' "$G"
+            fi
+          done
 
       - name: APK 빌드(release)
         run: |
