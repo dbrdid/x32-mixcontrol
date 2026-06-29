@@ -1392,6 +1392,44 @@ class GainPainter extends CustomPainter {
   bool shouldRepaint(covariant GainPainter o) => o.frac != frac;
 }
 
+// 게이트/컴프 THR 시각화: 실시간 신호 레벨이 아래에서 차오르고, threshold 라인을 넘으면
+// 게이트=열림(초록)·컴프=압축(주황)으로 강조 표시 — 음향 동작이 눈에 보이게.
+class DynPainter extends CustomPainter {
+  final double thr; // 0~1 (위로 갈수록 높은 threshold)
+  final double lvl; // 실시간 신호 레벨 0~1 (미터 없는 채널이면 0)
+  final bool gate;
+  DynPainter(this.thr, {this.lvl = 0, this.gate = false});
+  @override
+  void paint(Canvas canvas, Size size) {
+    final w = size.width, h = size.height;
+    final r = RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(8));
+    canvas.save();
+    canvas.clipRRect(r);
+    canvas.drawRect(Offset.zero & size, Paint()..color = const Color(0xFF0E1115));
+    final lv = lvl.clamp(0.0, 1.0);
+    final thrY = (1 - thr.clamp(0.0, 1.0)) * h;
+    final lvY = (1 - lv) * h;
+    final accentLine = gate ? const Color(0xFF33D17A) : const Color(0xFFE0A030);
+    final accentFill = gate ? const Color(0x6B33D17A) : const Color(0x6BE0A030);
+    if (lv > 0.001) {
+      // threshold 아래 신호(회색)
+      final below = math.max(lvY, thrY);
+      canvas.drawRect(Rect.fromLTWH(0, below, w, h - below), Paint()..color = const Color(0x3357606B));
+      // threshold 위로 넘은 신호(통과/압축 → 강조색)
+      if (lvY < thrY) {
+        canvas.drawRect(Rect.fromLTWH(0, lvY, w, thrY - lvY), Paint()..color = accentFill);
+      }
+    }
+    // threshold 라인
+    canvas.drawRect(Rect.fromLTWH(0, thrY - 1.5, w, 3), Paint()..color = accentLine);
+    canvas.restore();
+    canvas.drawRRect(r, Paint()..style = PaintingStyle.stroke..strokeWidth = 1..color = const Color(0xFF2A313B));
+  }
+
+  @override
+  bool shouldRepaint(covariant DynPainter o) => o.thr != thr || o.lvl != lvl || o.gate != gate;
+}
+
 class PanPainter extends CustomPainter {
   final double pan;
   PanPainter(this.pan);
@@ -1607,7 +1645,14 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
         ),
         const SizedBox(height: 8),
         // 게이트 thr 범위는 -80~0dB, 컴프는 -60~0dB (X32 표준)
-        _knob(label: 'THR', frac: thr, valText: '${((label == 'GATE' ? -80.0 : -60.0) * (1 - thr)).round()}dB', onDrag: (dy, h) => onThr(thr - dy / h)),
+        // 실시간 신호 레벨이 차오르고 threshold 라인을 넘으면 게이트=열림(초록)/컴프=압축(주황)으로 보인다
+        _knob(
+          label: 'THR',
+          frac: thr,
+          valText: '${((label == 'GATE' ? -80.0 : -60.0) * (1 - thr)).round()}dB',
+          onDrag: (dy, h) => onThr(thr - dy / h),
+          painter: DynPainter(thr, lvl: c.hasMeter ? c.lvl : 0.0, gate: label == 'GATE'),
+        ),
       ],
     );
   }
@@ -1628,22 +1673,23 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
     required double frac,
     required String valText,
     required void Function(double dy, double h) onDrag,
+    CustomPainter? painter,
   }) {
     const h = 96.0;
     return Column(
       children: [
-        Text(label, style: const TextStyle(fontSize: 10, color: Color(0xFF8A94A0), fontWeight: FontWeight.w700)),
+        Text(label, style: const TextStyle(fontSize: 11, color: Color(0xFF9AA4B0), fontWeight: FontWeight.w800, letterSpacing: 0.5)),
         const SizedBox(height: 5),
         GestureDetector(
           onVerticalDragUpdate: (d) => onDrag(d.delta.dy, h),
           child: CustomPaint(
             size: const Size(38, h),
-            painter: GainPainter(frac.clamp(0.0, 1.0)),
+            painter: painter ?? GainPainter(frac.clamp(0.0, 1.0)),
             child: const SizedBox(width: 38, height: h),
           ),
         ),
         const SizedBox(height: 5),
-        Text(valText, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w800, color: Color(0xFFE6EDF3), fontFeatures: [FontFeature('tnum')])),
+        Text(valText, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w900, color: Color(0xFFE6EDF3), fontFeatures: [FontFeature('tnum')])),
       ],
     );
   }
@@ -1747,7 +1793,7 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
     final isCut = b.t == 0 || b.t == 5;
     if (!isCut) {
       final denom = (h / 2 - 8).clamp(1.0, double.infinity); // 짧은 화면서 분모 0/음수 방지(드래그 반전 차단)
-      final db = ((h / 2 - p.dy) / denom) * 18;
+      final db = ((h / 2 - p.dy) / denom) * 15; // db2y와 동일한 ±15 스케일 → 드래그가 차트와 1:1로 맞음
       b.g = eqXfromG(db.clamp(-15.0, 15.0));
     }
     widget.mixer.sendEqBand(c, eqSel);
@@ -1772,8 +1818,8 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
                   ),
                   child: Column(
                     children: [
-                      Text('B${i + 1}', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: i == eqSel ? Colors.white : const Color(0xFF8A94A0))),
-                      Text(fmtHz(eqHz(c.eq[i].f)), style: const TextStyle(fontSize: 9, color: Color(0xFF7A8492))),
+                      Text('B${i + 1}', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800, color: i == eqSel ? const Color(0xFF22D3EE) : const Color(0xFFB8C2CE))),
+                      Text(fmtHz(eqHz(c.eq[i].f)), style: TextStyle(fontSize: 14, fontWeight: FontWeight.w800, color: i == eqSel ? Colors.white : const Color(0xFF9AA4B0), fontFeatures: const [FontFeature('tnum')])),
                     ],
                   ),
                 ),
@@ -1813,7 +1859,7 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
     const h = 92.0;
     return Column(
       children: [
-        Text(label, style: const TextStyle(fontSize: 10, color: Color(0xFF8A94A0), fontWeight: FontWeight.w700)),
+        Text(label, style: const TextStyle(fontSize: 11, color: Color(0xFF9AA4B0), fontWeight: FontWeight.w800, letterSpacing: 0.5)),
         const SizedBox(height: 5),
         GestureDetector(
           onVerticalDragUpdate: (d) => onDrag(d.delta.dy, h),
@@ -1824,7 +1870,7 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
           ),
         ),
         const SizedBox(height: 5),
-        Text(valText, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w800, color: Color(0xFFE6EDF3), fontFeatures: [FontFeature('tnum')])),
+        Text(valText, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900, color: Color(0xFF22D3EE), fontFeatures: [FontFeature('tnum')])),
       ],
     );
   }
@@ -1862,8 +1908,9 @@ class EqPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final w = size.width, h = size.height;
     canvas.drawRRect(RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(10)), Paint()..color = const Color(0xFF0C0E12));
+    canvas.clipRRect(RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(10))); // 곡선·점·RTA가 박스를 벗어나지 않게 클립
     double x2hz(double x) => 20 * math.pow(1000, x / w).toDouble();
-    double db2y(double db) => h / 2 - (db / 18) * (h / 2 - 8);
+    double db2y(double db) => h / 2 - (db / 15) * (h / 2 - 8); // ±15dB(게인 clamp와 일치) — 점이 차트 끝까지 닿고 안 벗어남
     final gp = Paint()..color = const Color(0xFF1C232C)..strokeWidth = 1;
     for (final hz in [100.0, 1000.0, 10000.0]) {
       final x = eqXfromHz(hz) * w;
@@ -1918,7 +1965,7 @@ class EqPainter extends CustomPainter {
       for (final bb in ch.eq) {
         yd += bandDb(bb, eqHz(b.f));
       }
-      final y = db2y(ch.eqon ? yd : 0);
+      final y = db2y(ch.eqon ? yd : 0).clamp(7.0, h - 7.0); // 합산이 ±15 넘어도 점은 차트 안에 가둔다
       canvas.drawCircle(Offset(x, y), i == sel ? 7 : 5, Paint()..color = i == sel ? const Color(0xFF22D3EE) : const Color(0xFF5B6675));
       final tp = TextPainter(
         text: TextSpan(text: '${i + 1}', style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: i == sel ? const Color(0xFF06222A) : const Color(0xFF0C0E12))),
